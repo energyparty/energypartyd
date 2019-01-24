@@ -1,0 +1,582 @@
+#! /usr/bin/python3
+
+# Copyright (c) 2016-Present Energyparty Developers
+# Distributed under the AGPL 3.0 with the OpenSSL exception, see the
+# accompanying file LICENSE or <https://github.com/energyparty/energypartyd/>.
+
+import struct
+import decimal
+D = decimal.Decimal
+import logging
+
+from . import (util, config, exceptions, bitcoin, util)
+
+FORMAT = '>QQQQHQ'
+LENGTH = 8 + 8 + 8 + 8 + 2 + 8
+ID = 10
+
+def exact_penalty (db, address, block_index, order_match_id):
+    cursor = db.cursor()
+
+    # Orders.
+    bad_orders = list(cursor.execute('''SELECT * FROM orders \
+                                        WHERE (source = ? AND give_asset = ? AND status = ?)''',
+                                     (address, config.BTC, 'open')))
+    for bad_order in bad_orders:
+        cancel_order(db, bad_order, 'expired', block_index)
+
+    if not (block_index >= 0 or config.TESTNET):
+        # Order matches.
+        bad_order_matches = list(cursor.execute('''SELECT * FROM order_matches \
+                                                   WHERE ((tx0_address = ? AND forward_asset = ?) OR (tx1_address = ? AND backward_asset = ?)) AND (status = ?)''',
+                                         (address, config.BTC, address, config.BTC, 'pending')))
+        for bad_order_match in bad_order_matches:
+            cancel_order_match(db, bad_order_match, 'expired', block_index)
+
+    cursor.close()
+    return
+
+
+def cancel_order (db, order, status, block_index):
+    cursor = db.cursor()
+
+    # Update status of order.
+    bindings = {
+        'status': status,
+        'tx_hash': order['tx_hash']
+    }
+    sql='update orders set status = :status where tx_hash = :tx_hash'
+    cursor.execute(sql, bindings)
+    util.message(db, block_index, 'update', 'orders', bindings)
+
+    if order['give_asset'] != config.BTC:
+        util.credit(db, block_index, order['source'], order['give_asset'], order['give_remaining'], event=order['tx_hash'])
+
+    if status == 'expired':
+        # Record offer expiration.
+        bindings = {
+            'order_index': order['tx_index'],
+            'order_hash': order['tx_hash'],
+            'source': order['source'],
+            'block_index': block_index
+        }
+        sql='insert into order_expirations values(:order_index, :order_hash, :source, :block_index)'
+        cursor.execute(sql, bindings)
+
+    cursor.close()
+
+def cancel_order_match (db, order_match, status, block_index):
+
+    cursor = db.cursor()
+
+    if not (block_index >= 0 or config.TESTNET):
+        order_matches = list(cursor.execute('''SELECT * FROM order_matches \
+                                               WHERE (id = ? AND status = ?)''',
+                                            (order_match['id'], 'expired')))
+        if order_matches:
+            cursor.close()
+            return
+
+    # Update status of order match.
+    bindings = {
+        'status': status,
+        'order_match_id': order_match['id']
+    }
+    sql='update order_matches set status = :status where id = :order_match_id'
+    cursor.execute(sql, bindings)
+    util.message(db, block_index, 'update', 'order_matches', bindings)
+
+    order_match_id = order_match['tx0_hash'] + order_match['tx1_hash']
+
+    # If tx0 is dead, credit address directly; if not, replenish give remaining, get remaining, and fee required remaining.
+    orders = list(cursor.execute('''SELECT * FROM orders \
+                                    WHERE tx_index = ?''',
+                                 (order_match['tx0_index'],)))
+    assert len(orders) == 1
+    tx0_order = orders[0]
+    if tx0_order['status'] in ('expired', 'cancelled'):
+        tx0_order_status = tx0_order['status']
+        if order_match['forward_asset'] != config.BTC:
+            util.credit(db, block_index, order_match['tx0_address'],
+                        order_match['forward_asset'],
+                        order_match['forward_quantity'], event=order_match['id'])
+    else:
+        tx0_give_remaining = tx0_order['give_remaining'] + order_match['forward_quantity']
+        tx0_get_remaining = tx0_order['get_remaining'] + order_match['backward_quantity']
+        if tx0_order['get_asset'] == config.BTC and (block_index >= 0 or config.TESTNET):
+            tx0_fee_required_remaining = tx0_order['fee_required_remaining'] + order_match['fee_paid']
+        else:
+            tx0_fee_required_remaining = tx0_order['fee_required_remaining']
+        tx0_order_status = tx0_order['status']
+        bindings = {
+            'give_remaining': tx0_give_remaining,
+            'get_remaining': tx0_get_remaining,
+            'status': tx0_order_status,
+            'fee_required_remaining': tx0_fee_required_remaining,
+            'tx_hash': order_match['tx0_hash']
+        }
+        sql='update orders set give_remaining = :give_remaining, get_remaining = :get_remaining, fee_required_remaining = :fee_required_remaining where tx_hash = :tx_hash'
+        cursor.execute(sql, bindings)
+        util.message(db, block_index, 'update', 'orders', bindings)
+
+    # If tx1 is dead, credit address directly; if not, replenish give remaining, get remaining, and fee required remaining.
+    orders = list(cursor.execute('''SELECT * FROM orders \
+                                    WHERE tx_index = ?''',
+                                 (order_match['tx1_index'],)))
+    assert len(orders) == 1
+    tx1_order = orders[0]
+    if tx1_order['status'] in ('expired', 'cancelled'):
+        tx1_order_status = tx1_order['status']
+        if order_match['backward_asset'] != config.BTC:
+            util.credit(db, block_index, order_match['tx1_address'],
+                        order_match['backward_asset'],
+                        order_match['backward_quantity'], event=order_match['id'])
+    else:
+        tx1_give_remaining = tx1_order['give_remaining'] + order_match['backward_quantity']
+        tx1_get_remaining = tx1_order['get_remaining'] + order_match['forward_quantity']
+        if tx1_order['get_asset'] == config.BTC and (block_index >= 0 or config.TESTNET):
+            tx1_fee_required_remaining = tx1_order['fee_required_remaining'] + order_match['fee_paid']
+        else:
+            tx1_fee_required_remaining = tx1_order['fee_required_remaining']
+        tx1_order_status = tx1_order['status']
+        bindings = {
+            'give_remaining': tx1_give_remaining,
+            'get_remaining': tx1_get_remaining,
+            'status': tx1_order_status,
+            'fee_required_remaining': tx1_fee_required_remaining,
+            'tx_hash': order_match['tx1_hash']
+        }
+        sql='update orders set give_remaining = :give_remaining, get_remaining = :get_remaining, fee_required_remaining = :fee_required_remaining where tx_hash = :tx_hash'
+        cursor.execute(sql, bindings)
+        util.message(db, block_index, 'update', 'orders', bindings)
+
+    if block_index < 0:
+        # Sanity check: one of the two must have expired.
+        tx0_order_time_left = tx0_order['expire_index'] - block_index
+        tx1_order_time_left = tx1_order['expire_index'] - block_index
+        assert tx0_order_time_left or tx1_order_time_left
+
+    if block_index >= 0 or config.TESTNET:
+        if tx0_order['status'] == 'expired' and order_match['forward_asset'] == config.BTC:
+            exact_penalty(db, order_match['tx0_address'], block_index, order_match['id'])
+        if tx1_order['status'] == 'expired' and order_match['backward_asset'] == config.BTC:
+            exact_penalty(db, order_match['tx1_address'], block_index, order_match['id'])
+
+    # Re‐match.
+    if block_index >= 0 or config.TESTNET:
+        if not (block_index >= 0 or config.TESTNET):
+            cursor.execute('''SELECT * FROM transactions\
+                              WHERE tx_hash = ?''', (tx0_order['tx_hash'],))
+            match(db, list(cursor)[0], block_index)
+            cursor.execute('''SELECT * FROM transactions\
+                              WHERE tx_hash = ?''', (tx1_order['tx_hash'],))
+            match(db, list(cursor)[0], block_index)
+
+    if status == 'expired':
+        # Record order match expiration.
+        bindings = {
+            'order_match_id': order_match['id'],
+            'tx0_address': order_match['tx0_address'],
+            'tx1_address': order_match['tx1_address'],
+            'block_index': block_index
+        }
+        sql='insert into order_match_expirations values(:order_match_id, :tx0_address, :tx1_address, :block_index)'
+        cursor.execute(sql, bindings)
+
+    cursor.close()
+
+
+def validate (db, source, give_asset, give_quantity, get_asset, get_quantity, expiration, fee_required):
+    problems = []
+    cursor = db.cursor()
+
+    if give_asset == config.BTC and get_asset == config.BTC:
+        problems.append('cannot trade {} for itself'.format(config.BTC))
+
+    if not isinstance(give_quantity, int):
+        problems.append('A rounding issue of give_quantity is detected. Please try to reduce the number of decimal places to pass through')
+        return problems
+    if not isinstance(get_quantity, int):
+        problems.append('A rounding issue of get_quantity is detected. Please try to reduce the number of decimal places to pass through')
+        return problems
+    if not isinstance(fee_required, int):
+        problems.append('fee_required must be in satoshis')
+        return problems
+    if not isinstance(expiration, int):
+        problems.append('expiration must be expressed as an integer block delta')
+        return problems
+
+    if give_quantity <= 0: problems.append('non‐positive give quantity')
+    if get_quantity <= 0: problems.append('non‐positive get quantity')
+    if fee_required < 0: problems.append('negative fee_required')
+    if expiration < 0: problems.append('negative expiration')
+
+    if not give_quantity or not get_quantity:
+        problems.append('zero give or zero get')
+    cursor.execute('select * from issuances where (status = ? and asset = ?)', ('valid', give_asset))
+    if give_asset not in (config.BTC, config.XCP) and not cursor.fetchall():
+        problems.append('no such asset to give ({})'.format(give_asset))
+    cursor.execute('select * from issuances where (status = ? and asset = ?)', ('valid', get_asset))
+    if get_asset not in (config.BTC, config.XCP) and not cursor.fetchall():
+        problems.append('no such asset to get ({})'.format(get_asset))
+    if expiration > config.MAX_EXPIRATION:
+        problems.append('expiration overflow')
+
+    # For SQLite3
+    if give_quantity > config.MAX_INT or get_quantity > config.MAX_INT or fee_required > config.MAX_INT:
+        problems.append('integer overflow')
+
+    cursor.close()
+    return problems
+
+def compose (db, source, give_asset, give_quantity, get_asset, get_quantity, expiration, fee_required):
+    cursor = db.cursor()
+    if give_asset == config.BTC:
+        if sum(out['amount'] for out in bitcoin.get_unspent_txouts(source, unconfirmed=False)) * config.UNIT < give_quantity:
+            print('WARNING: insufficient funds for {}pay.'.format(config.BTC))
+    else:
+        balances = list(cursor.execute('''SELECT * FROM balances WHERE (address = ? AND asset = ?)''', (source, give_asset)))
+        if (not balances or balances[0]['quantity'] < give_quantity):
+            raise exceptions.OrderError('insufficient funds')
+
+    problems = validate(db, source, give_asset, give_quantity, get_asset, get_quantity, expiration, fee_required)
+    if problems: raise exceptions.OrderError(problems)
+
+    give_id = util.asset_id(give_asset)
+    get_id = util.asset_id(get_asset)
+    data = config.PREFIX + struct.pack(config.TXTYPE_FORMAT, ID)
+    data += struct.pack(FORMAT, give_id, give_quantity, get_id, get_quantity,
+                        expiration, fee_required)
+    cursor.close()
+    return (source, [], data)
+
+def parse (db, tx, message):
+    order_parse_cursor = db.cursor()
+
+    # Unpack message.
+    try:
+        assert len(message) == LENGTH
+        give_id, give_quantity, get_id, get_quantity, expiration, fee_required = struct.unpack(FORMAT, message)
+        give_asset = util.asset_name(give_id)
+        get_asset = util.asset_name(get_id)
+        status = 'open'
+    except (AssertionError, struct.error) as e:
+        give_asset, give_quantity, get_asset, get_quantity, expiration, fee_required = 0, 0, 0, 0, 0, 0
+        status = 'invalid: could not unpack'
+
+    price = 0
+    if status == 'open':
+        try: price = util.price(get_quantity, give_quantity, tx['block_index'])
+        except Exception as e: pass
+
+        # Overorder
+        order_parse_cursor.execute('''SELECT * FROM balances \
+                                      WHERE (address = ? AND asset = ?)''', (tx['source'], give_asset))
+        balances = list(order_parse_cursor)
+        if give_asset != config.BTC:
+            if not balances:
+                give_quantity = 0
+            else:
+                balance = balances[0]['quantity']
+                if balance < give_quantity:
+                    give_quantity = balance
+                    get_quantity = int(price * give_quantity)
+
+        problems = validate(db, tx['source'], give_asset, give_quantity, get_asset, get_quantity, expiration, fee_required)
+        if problems: status = 'invalid: ' + '; '.join(problems)
+
+    if status == 'open':
+        if give_asset != config.BTC:
+            util.debit(db, tx['block_index'], tx['source'], give_asset, give_quantity, event=tx['tx_hash'])
+
+    # Add parsed transaction to message-type–specific table.
+    bindings = {
+        'tx_index': tx['tx_index'],
+        'tx_hash': tx['tx_hash'],
+        'block_index': tx['block_index'],
+        'source': tx['source'],
+        'give_asset': give_asset,
+        'give_quantity': give_quantity,
+        'give_remaining': give_quantity,
+        'get_asset': get_asset,
+        'get_quantity': get_quantity,
+        'get_remaining': get_quantity,
+        'expiration': expiration,
+        'expire_index': tx['block_index'] + expiration,
+        'fee_required': fee_required,
+        'fee_required_remaining': fee_required,
+        'fee_provided': tx['fee'],
+        'fee_provided_remaining': tx['fee'],
+        'status': status,
+    }
+    sql='insert into orders values(:tx_index, :tx_hash, :block_index, :source, :give_asset, :give_quantity, :give_remaining, :get_asset, :get_quantity, :get_remaining, :expiration, :expire_index, :fee_required, :fee_required_remaining, :fee_provided, :fee_provided_remaining, :status)'
+    order_parse_cursor.execute(sql, bindings)
+
+    # Match.
+    if status == 'open' and tx['block_index'] != config.MEMPOOL_BLOCK_INDEX:
+        match(db, tx)
+
+    order_parse_cursor.close()
+
+def match (db, tx, block_index=None):
+
+    cursor = db.cursor()
+
+    # Get order in question.
+    orders = list(cursor.execute('''SELECT * FROM orders\
+                                    WHERE (tx_index = ? AND status = ?)''', (tx['tx_index'], 'open')))
+    if not orders:
+        cursor.close()
+        return
+    else:
+        assert len(orders) == 1
+    tx1 = orders[0]
+
+    cursor.execute('''SELECT * FROM orders \
+                      WHERE (give_asset=? AND get_asset=? AND status=? AND tx_hash != ?)''',
+                   (tx1['get_asset'], tx1['give_asset'], 'open', tx1['tx_hash']))
+
+    tx1_give_remaining = tx1['give_remaining']
+    tx1_get_remaining = tx1['get_remaining']
+
+    order_matches = cursor.fetchall()
+    if tx['block_index'] > 0 or config.TESTNET:
+        order_matches = sorted(order_matches, key=lambda x: x['tx_index'])                              # Sort by tx index second.
+        order_matches = sorted(order_matches, key=lambda x: util.price(x['get_quantity'], x['give_quantity'], tx1['block_index']))   # Sort by price first.
+
+    # Get fee remaining.
+    tx1_fee_required_remaining = tx1['fee_required_remaining']
+    tx1_fee_provided_remaining = tx1['fee_provided_remaining']
+
+    tx1_status = tx1['status']
+    for tx0 in order_matches:
+        order_match_id = tx0['tx_hash'] + tx1['tx_hash']
+        if not block_index: 
+            block_index = max(tx0['block_index'], tx1['block_index'])
+        if tx1_status != 'open': break
+
+        logging.debug('Considering: ' + tx0['tx_hash'])
+        tx0_give_remaining = tx0['give_remaining']
+        tx0_get_remaining = tx0['get_remaining']
+
+        # Ignore previous matches. (Both directions, just to be sure.)
+        cursor.execute('''SELECT * FROM order_matches
+                          WHERE id = ? ''', (tx0['tx_hash'] + tx1['tx_hash'], ))
+        if list(cursor):
+            logging.debug('Skipping: previous match')
+            continue
+        cursor.execute('''SELECT * FROM order_matches
+                          WHERE id = ? ''', (tx1['tx_hash'] + tx0['tx_hash'], ))
+        if list(cursor):
+            logging.debug('Skipping: previous match')
+            continue
+
+        # Get fee provided remaining.
+        tx0_fee_required_remaining = tx0['fee_required_remaining']
+        tx0_fee_provided_remaining = tx0['fee_provided_remaining']
+
+        if tx0['give_asset'] == config.BTC or tx0['get_asset'] == config.BTC: # Gratuitous
+            if tx0_give_remaining <= 0 or tx1_give_remaining <= 0:
+                logging.debug('Skipping: negative give quantity remaining')
+                continue
+
+            if block_index >= 0 or config.TESTNET:
+                if tx0['fee_required_remaining'] < 0:
+                    logging.debug('Skipping: negative tx0 fee required remaining')
+                    continue
+                if tx0['fee_provided_remaining'] < 0:
+                    logging.debug('Skipping: negative tx0 fee provided remaining')
+                    continue
+                if tx1_fee_provided_remaining < 0:
+                    logging.debug('Skipping: negative tx1 fee provided remaining')
+                    continue
+                if tx1_fee_required_remaining < 0:
+                    logging.debug('Skipping: negative tx1 fee required remaining')
+                    continue
+
+        tx0_price = util.price(tx0['get_quantity'], tx0['give_quantity'], block_index)
+        tx1_price = util.price(tx1['get_quantity'], tx1['give_quantity'], block_index)
+        tx1_inverse_price = util.price(tx1['give_quantity'], tx1['get_quantity'], block_index)
+
+        if tx['block_index'] < 0: tx1_inverse_price = util.price(1, tx1_price, block_index)
+
+        logging.debug('Tx0 Price: {}; Tx1 Inverse Price: {}'.format(float(tx0_price), float(tx1_inverse_price)))
+        if tx0_price <= tx1_inverse_price:
+            logging.debug('Potential forward quantities: {}, {}'.format(tx0_give_remaining, int(util.price(tx1_give_remaining, tx0_price, block_index))))
+            forward_quantity = int(min(tx0_give_remaining, int(util.price(tx1_give_remaining, tx0_price, block_index))))
+            logging.debug('Forward Quantity: {}'.format(forward_quantity))
+            backward_quantity = round(forward_quantity * tx0_price)
+            logging.debug('Backward Quantity: {}'.format(backward_quantity))
+
+            if not forward_quantity:
+                logging.debug('Skipping: zero forward quantity.')
+                continue
+            if block_index >= 0 or config.TESTNET:
+                if not backward_quantity:
+                    logging.debug('Skipping: zero backward quantity.')
+                    continue
+
+            forward_asset, backward_asset = tx1['get_asset'], tx1['give_asset']
+
+            if block_index >= 0 or config.TESTNET:
+                min_btc_quantity = 0.01 * config.UNIT
+                if (forward_asset == config.BTC and forward_quantity <= min_btc_quantity) or (backward_asset == config.BTC and backward_quantity <= min_btc_quantity):
+                    logging.debug('Skipping: below minimum {} quantity'.format(config.BTC))
+                    continue
+
+            # Check and update fee remainings.
+            fee = 0
+            if block_index >= 0 or config.TESTNET:
+                if tx1['get_asset'] == config.BTC:
+                    
+                    if block_index >= 0 or config.TESTNET:
+                        fee = int(tx1['fee_required'] * util.price(backward_quantity, tx1['give_quantity'], block_index))
+                    else:
+                        fee = int(tx1['fee_required_remaining'] * util.price(forward_quantity, tx1_get_remaining, block_index))
+                    
+                    logging.debug('Tx0 fee provided remaining: {}; required fee: {}'.format(tx0_fee_provided_remaining / config.UNIT, fee / config.UNIT))
+                    if tx0_fee_provided_remaining < fee:
+                        logging.debug('Skipping: tx0 fee provided remaining is too low.')
+                        continue
+                    else:
+                        tx0_fee_provided_remaining -= fee
+                        if block_index >= 0 or config.TESTNET:
+                            tx1_fee_required_remaining -= fee
+
+                elif tx1['give_asset'] == config.BTC:
+
+                    if block_index >= 0 or config.TESTNET:
+                        fee = int(tx0['fee_required'] * util.price(backward_quantity, tx0['give_quantity'], block_index))
+                    else:   
+                        fee = int(tx0['fee_required_remaining'] * util.price(backward_quantity, tx0_get_remaining, block_index))
+
+                    logging.debug('Tx1 fee provided remaining: {}; required fee: {}'.format(tx1_fee_provided_remaining / config.UNIT, fee / config.UNIT))
+                    if tx1_fee_provided_remaining < fee:
+                        logging.debug('Skipping: tx1 fee provided remaining is too low.')
+                        continue
+                    else:
+                        tx1_fee_provided_remaining -= fee
+                        if block_index >= 0 or config.TESTNET:
+                            tx0_fee_required_remaining -= fee
+                            
+            else:
+                if tx1['get_asset'] == config.BTC:
+                    if tx0_fee_provided_remaining < tx1['fee_required']: continue
+                elif tx1['give_asset'] == config.BTC:
+                    if tx1_fee_provided_remaining < tx0['fee_required']: continue
+
+            if config.BTC in (tx1['give_asset'], tx1['get_asset']):
+                status = 'pending'
+            else:
+                status = 'completed'
+                # Credit.
+                util.credit(db, tx['block_index'], tx1['source'], tx1['get_asset'],
+                                    forward_quantity, event=order_match_id)
+                util.credit(db, tx['block_index'], tx0['source'], tx0['get_asset'],
+                                    backward_quantity, event=order_match_id)
+
+            tx0_give_remaining -= forward_quantity
+            tx0_get_remaining -= backward_quantity
+            tx1_give_remaining -= backward_quantity
+            tx1_get_remaining -= forward_quantity
+
+            # Update give_remaining, get_remaining.
+            # tx0
+            tx0_status = 'open'
+            if tx0_give_remaining <= 0 or (tx0_get_remaining <= 0 and (block_index >= 0 or config.TESTNET)):
+                if tx0['give_asset'] != config.BTC and tx0['get_asset'] != config.BTC:
+                    # Fill order, and recredit give_remaining.
+                    tx0_status = 'filled'
+                    util.credit(db, block_index, tx0['source'], tx0['give_asset'], tx0_give_remaining, event=tx1['tx_hash'], action='filled')
+            bindings = {
+                'give_remaining': tx0_give_remaining,
+                'get_remaining': tx0_get_remaining,
+                'fee_required_remaining': tx0_fee_required_remaining,
+                'fee_provided_remaining': tx0_fee_provided_remaining,
+                'status': tx0_status,
+                'tx_hash': tx0['tx_hash']
+            }
+            sql='update orders set give_remaining = :give_remaining, get_remaining = :get_remaining, fee_required_remaining = :fee_required_remaining, fee_provided_remaining = :fee_provided_remaining, status = :status where tx_hash = :tx_hash'
+            cursor.execute(sql, bindings)
+            util.message(db, block_index, 'update', 'orders', bindings)
+            # tx1
+            if tx1_give_remaining <= 0 or (tx1_get_remaining <= 0 and (block_index >= 0 or config.TESTNET)):
+                if tx1['give_asset'] != config.BTC and tx1['get_asset'] != config.BTC:
+                    # Fill order, and recredit give_remaining.
+                    tx1_status = 'filled'
+                    util.credit(db, block_index, tx1['source'], tx1['give_asset'], tx1_give_remaining, event=tx0['tx_hash'], action='filled')
+            bindings = {
+                'give_remaining': tx1_give_remaining,
+                'get_remaining': tx1_get_remaining,
+                'fee_required_remaining': tx1_fee_required_remaining,
+                'fee_provided_remaining': tx1_fee_provided_remaining,
+                'status': tx1_status,
+                'tx_hash': tx1['tx_hash']
+            }
+            sql='update orders set give_remaining = :give_remaining, get_remaining = :get_remaining, fee_required_remaining = :fee_required_remaining, fee_provided_remaining = :fee_provided_remaining, status = :status where tx_hash = :tx_hash'
+            cursor.execute(sql, bindings)
+            util.message(db, block_index, 'update', 'orders', bindings)
+
+            if block_index >= 0 or config.TESTNET:
+                match_expire_index = block_index + 20
+            else:
+                match_expire_index = min(tx0['expire_index'], tx1['expire_index'])
+
+            # Record order match.
+            bindings = {
+                'id': tx0['tx_hash'] + tx['tx_hash'],
+                'tx0_index': tx0['tx_index'],
+                'tx0_hash': tx0['tx_hash'],
+                'tx0_address': tx0['source'],
+                'tx1_index': tx1['tx_index'],
+                'tx1_hash': tx1['tx_hash'],
+                'tx1_address': tx1['source'],
+                'forward_asset': forward_asset,
+                'forward_quantity': forward_quantity,
+                'backward_asset': backward_asset,
+                'backward_quantity': backward_quantity,
+                'tx0_block_index': tx0['block_index'],
+                'tx1_block_index': tx1['block_index'],
+                'block_index': block_index,
+                'tx0_expiration': tx0['expiration'],
+                'tx1_expiration': tx1['expiration'],
+                'match_expire_index': match_expire_index,
+                'fee_paid': fee,
+                'status': status,
+            }
+            sql='insert into order_matches values(:id, :tx0_index, :tx0_hash, :tx0_address, :tx1_index, :tx1_hash, :tx1_address, :forward_asset, :forward_quantity, :backward_asset, :backward_quantity, :tx0_block_index, :tx1_block_index, :block_index, :tx0_expiration, :tx1_expiration, :match_expire_index, :fee_paid, :status)'
+            cursor.execute(sql, bindings)
+
+            if tx1_status == 'filled':
+                break
+
+    cursor.close()
+    return
+
+def expire (db, block_index):
+    cursor = db.cursor()
+
+    cursor.execute('''SELECT * FROM orders \
+                      WHERE (status = ? AND expire_index < ?)''', ('open', block_index))
+    orders = list(cursor)
+    for order in orders:
+        cancel_order(db, order, 'expired', block_index)
+
+    cursor.execute('''SELECT * FROM order_matches \
+                      WHERE (status = ? and match_expire_index < ?)''', ('pending', block_index))
+    order_matches = list(cursor)
+    for order_match in order_matches:
+        cancel_order_match(db, order_match, 'expired', block_index)
+    if block_index >= 0 or config.TESTNET:
+        # Re‐match.
+        for order_match in order_matches:
+            cursor.execute('''SELECT * FROM transactions\
+                              WHERE tx_hash = ?''', (order_match['tx0_hash'],))
+            match(db, list(cursor)[0], block_index)
+            cursor.execute('''SELECT * FROM transactions\
+                              WHERE tx_hash = ?''', (order_match['tx1_hash'],))
+            match(db, list(cursor)[0], block_index)
+
+    cursor.close()
+
+# vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4
